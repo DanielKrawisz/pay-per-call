@@ -238,7 +238,8 @@ net::HTTP::response pay_per_call::call (const net::HTTP::request &req) {
         // post to the io context a function that broadcasts the tx and put it into our wallet.
         asio::post (IOC, [self = shared_from_this (), tx] () {
             if (!self->Wallet.net ()->broadcast (bytes (tx))) {
-                // not sure what to do here. We've been scammed and that shouldn't be possible.
+                // We've been scammed and that shouldn't be possible.
+                // TODO make a log or send myself an email.
             }
         });
     } else {
@@ -272,15 +273,6 @@ net::HTTP::response pay_per_call::make_402 (Bitcoin::satoshi price) {
         JSON (payment_request).dump ()};
 }
 
-ptr<pay_per_call::offer> pay_per_call::offers::operator () (const net::URL &u) const {
-    for (const auto &[key, value] : Offers) if (std::regex_match (static_cast<std::string> (u), key)) return value;
-    return nullptr;
-};
-
-struct whatsonchain_offer : pay_per_call::offer {
-    net::HTTP::response operator () () final override;
-};
-
 pay_per_call::payment_address pay_per_call::get_new_address () {
     auto &pubkeys = Wallet.watch_wallet ()->Pubkeys;
     auto *p = pubkeys.Map.contains (pubkeys.Receive);
@@ -293,16 +285,48 @@ pay_per_call::payment_address pay_per_call::get_new_address () {
     return payment_address {new_addr,
         Bitcoin::timestamp {uint32 (now) + static_cast<uint32> (Parameter.InactiveAddressExpiration.count () / 1000)}};
 }
-/*
-pay_per_call::offers::offers () {
-
-}
-
-net::HTTP::response whatsonchain_offer::operator () () {
-
-}
 
 parameters::parameters (const io::arg_parser &p) {
+    maybe<string> endpoint;
+    p.get ("endpoint", endpoint);
+    if (!bool (endpoint)) throw exception {} << "must provide a TCP endpoint to listen from";
+
+    Endpoint = net::IP::TCP::endpoint {*endpoint};
+
+    maybe<uint32> inactive_address_expiration_seconds;
+    p.get ("inactive_address_expiration", inactive_address_expiration_seconds);
+    if (bool (inactive_address_expiration_seconds))
+        InactiveAddressExpiration = duration {1000 * *inactive_address_expiration_seconds};
+
+    maybe<uint32> absolute_address_expiration_seconds;
+    p.get ("absolute_address_expiration", absolute_address_expiration_seconds);
+    if (bool (absolute_address_expiration_seconds))
+        AbsoluteAddressExpiration = duration {1000 * *absolute_address_expiration_seconds};
+
+    maybe<uint32> max_expected_outputs_per_payment;
+    p.get ("max_expected_outputs_per_payment", max_expected_outputs_per_payment);
+    if (bool (max_expected_outputs_per_payment))
+        MaxExpectedOutputsPerPayment = *max_expected_outputs_per_payment;
+
+    maybe<uint32> expected_fee_per_kilobyte;
+    p.get ("expected_fee_per_kilobyte", expected_fee_per_kilobyte);
+    if (bool (expected_fee_per_kilobyte))
+        ExpectedFee = satoshi_per_byte {50, 1024};
+
+}
+
+ptr<pay_per_call::offer> pay_per_call::offers::operator () (const net::URL &u) const {
+    for (const auto &[key, value] : Offers) if (std::regex_match (static_cast<std::string> (u), key)) return value;
+    return nullptr;
+};
+/*
+struct whatsonchain_offer : pay_per_call::offer {
+    net::HTTP::response operator () () final override {
+
+    }
+};
+
+pay_per_call::offers::offers () {
 
 }*/
 
