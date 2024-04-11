@@ -22,6 +22,8 @@ int main (int arg_count, char **arg_values) {
 #include <data/net/asio/periodic_timer.hpp>
 #include <gigamonkey/fees.hpp>
 
+#include <regex>
+
 namespace Bitcoin = Gigamonkey::Bitcoin;
 namespace asio = data::net::asio;
 using satoshi_per_byte = Gigamonkey::satoshi_per_byte;
@@ -49,14 +51,30 @@ struct parameters {
     parameters (const io::arg_parser &);
 };
 
-class pay_per_call {
+struct pay_per_call : std::enable_shared_from_this<pay_per_call> {
+    parameters Parameter;
+
+    pay_per_call (asio::io_context &ioc, Cosmos::context &, const arg_parser &p);
+    net::HTTP::response call (const net::HTTP::request &req);
+
+    // this represents a single call that we support as a paid service.
+    struct offer {
+        // the price to be paid to make the call.
+        Bitcoin::satoshi Price;
+        // make the call
+        virtual net::HTTP::response operator () () = 0;
+        virtual ~offer () {}
+    };
+
+private:
+    asio::io_context &IOC;
 
     // Cosmos::context is the wallet and the connection to the Bitcoin network.
     // not necessarily a great interface ATM but it works ok.
     Cosmos::context &Wallet;
 
     // we will keep track of addresses we have provided to users.
-    struct payment_address {
+    struct address_data {
         // how to find the key that redeems this address.
         Cosmos::derivation Derivation;
         // when was the address derived.
@@ -66,40 +84,36 @@ class pay_per_call {
     };
 
     // set of active addresses.
-    std::map<digest160, payment_address> Addresses;
+    std::map<digest160, address_data> Addresses;
 
-    // this represents a single call that we support as a paid service.
-    struct call {
-        // the price to be paid to make the call.
-        Bitcoin::satoshi Price;
-        // make the call
-        virtual net::HTTP::response operator () () = 0;
-        virtual ~call () {}
-    };
-
-    struct calls {
+    struct offers {
         // check a url to see if we offer it as a service.
         // if not, nullptr will be returned. Otherwise, we
         // will get a price and a function to call if the
         // payment is valid.
-        ptr<call> operator () (const net::URL &u);
+        ptr<offer> operator () (const net::URL &u) const;
 
-        calls ();
+        offers ();
+
+    private:
+        list<std::pair<std::regex, ptr<offer>>> Offers;
     };
 
-    calls Calls;
+    offers Offers;
 
     // a timer to remove inactive addresses.
     ptr<net::asio::periodic_timer> Timer;
 
+    struct payment_address {
+        Bitcoin::address Address;
+        Bitcoin::timestamp Expiration;
+    };
+
+    payment_address get_new_address ();
+
     // make a new 402 response to send back to a user for a given price.
     net::HTTP::response make_402 (Bitcoin::satoshi);
 
-public:
-    parameters Parameter;
-
-    pay_per_call (asio::io_context &ioc, Cosmos::context &, const arg_parser &p);
-    net::HTTP::response operator () (const net::HTTP::request &req);
 };
 
 #include <data/io/exception.hpp>
@@ -115,13 +129,19 @@ Cosmos::error run_program (const arg_parser &p) {
 
         // load wallet.
         Cosmos::context Wallet {};
+
+        // we don't need to spend any coins for this application,
+        // so we only load the watch wallet.
         Cosmos::read_watch_wallet_options (Wallet, p);
 
         // when we run this, all async calls will begin operation.
         boost::asio::io_context ioc;
 
-        pay_per_call program {ioc, Wallet, p};
-        net::HTTP::server server {ioc, program.Parameter.Endpoint, program};
+        auto program = std::make_shared<pay_per_call> (ioc, Wallet, p);
+        net::HTTP::server server {ioc, program->Parameter.Endpoint,
+            [program] (const net::HTTP::request &req) -> net::HTTP::response {
+                return program->call (req);
+            }};
 
         ioc.run ();
     } catch (const data::exception &x) {
@@ -138,21 +158,22 @@ Cosmos::error run_program (const arg_parser &p) {
 }
 
 #include <gigamonkey/script/pattern/pay_to_address.hpp>
+#include <gigamonkey/pay/SVP_envelope.hpp>
 
 using pay_to_address = Gigamonkey::pay_to_address;
 
 pay_per_call::pay_per_call (asio::io_context &ioc, Cosmos::context &wallet, const arg_parser &p):
-    Wallet {wallet}, Addresses {}, Calls {},
+    IOC {ioc}, Wallet {wallet}, Addresses {}, Offers {},
     Timer {new net::asio::periodic_timer {ioc,
         // run every 10 seconds.
         boost::posix_time::time_duration {0, 0, 10, 0},
-        [this] () {
+        [self = shared_from_this ()] () {
             // go through all the addresses and remove expired.
             time_point now = std::chrono::system_clock::now ();
-            for (auto it = this->Addresses.cbegin (); it != this->Addresses.cend ();)
-                if (now - it->second.LastSeen < this->Parameter.InactiveAddressExpiration ||
-                    now - it->second.DerivationTime < this->Parameter.AbsoluteAddressExpiration
-                ) it = this->Addresses.erase (it);
+            for (auto it = self->Addresses.cbegin (); it != self->Addresses.cend ();)
+                if (now - it->second.LastSeen < self->Parameter.InactiveAddressExpiration ||
+                    now - it->second.DerivationTime < self->Parameter.AbsoluteAddressExpiration
+                ) it = self->Addresses.erase (it);
                 else ++it;
         }
     }}, Parameter {p} {}
@@ -166,18 +187,28 @@ Bitcoin::satoshi inline demanded_price (Bitcoin::satoshi base_price, satoshi_per
     return base_price + round_up (10 * double (expected_fee) * pay_to_address::redeem_expected_size ());
 }
 
-net::HTTP::response pay_per_call::operator () (const net::HTTP::request &req) {
+net::HTTP::response pay_per_call::call (const net::HTTP::request &req) {
     // do we recognize this call?
-    ptr<call> offer = Calls (req.URL);
-    if (offer == nullptr) return net::HTTP::response {net::HTTP::status {404}, {}, ""};
+    ptr<offer> o = Offers (req.URL);
+    if (o == nullptr) return net::HTTP::response {net::HTTP::status {404}, {}, ""};
 
-    // has a payment been included?
-    Cosmos::processed processed {req.Body};
-    Bitcoin::transaction tx {processed.Transaction};
+    // the transaction that is being paid to us.
+    Bitcoin::transaction tx;
 
-    if (!tx.valid ()) return make_402 (demanded_price (offer->Price, Parameter.ExpectedFee, Parameter.MaxExpectedOutputsPerPayment));
+    // Try to read as an SPV_envelope https://tsc.bsvblockchain.org/standards/transaction-ancestors/
+    Gigamonkey::nChain::SPV_envelope spv_tx {req.Body};
 
-    Bitcoin::txid id = processed.id ();
+    bool proofs_included = spv_tx.validate (*Wallet.spvdb ());
+    if (proofs_included) tx = Bitcoin::transaction {spv_tx.RawTx};
+    // if we can't read an SPV proof, try to read the body as a tx in hex.
+    else if (maybe<bytes> raw = encoding::hex::read (req.Body); bool (raw)) tx = Bitcoin::transaction {*raw};
+    // otherwise try to read the body as a tx in raw bytes.
+    else tx = Bitcoin::transaction {bytes (req.Body)};
+
+    // if not, send a 402 error.
+    if (!tx.valid ()) return make_402 (demanded_price (o->Price, Parameter.ExpectedFee, Parameter.MaxExpectedOutputsPerPayment));
+
+    Bitcoin::txid id = tx.id ();
 
     // do we recognize the address?
     Bitcoin::satoshi value_paid_to_us {0};
@@ -200,35 +231,78 @@ net::HTTP::response pay_per_call::operator () (const net::HTTP::request &req) {
     if (value_paid_to_us - round_up (
         double (Parameter.ExpectedFee) *
         data::size (our_new_outputs) *
-        pay_to_address::redeem_expected_size ()) < offer->Price)
-        return make_402 (demanded_price (offer->Price, Parameter.ExpectedFee, Parameter.MaxExpectedOutputsPerPayment));
+        pay_to_address::redeem_expected_size ()) < o->Price)
+        return make_402 (demanded_price (o->Price, Parameter.ExpectedFee, Parameter.MaxExpectedOutputsPerPayment));
 
-    if (processed.Proof != nullptr) {
-        // TODO
-        // Are the merkle proofs included? If so, we can accept the tx immediately
-        // note: waiting to broadcast the payment and check if it is accepted is not
-        // necessarily faster than using the free api with rate limiting. A truly
-        // better service would require merkle proofs. Then the tx could be accepted
-        // as soon as the proofs were validated, and then broadcast concurrently
-        // with the API call.
+    if (proofs_included) {
+        // post to the io context a function that broadcasts the tx and put it into our wallet.
+        asio::post (IOC, [self = shared_from_this (), tx] () {
+            if (!self->Wallet.net ()->broadcast (bytes (tx))) {
+                // not sure what to do here. We've been scammed and that shouldn't be possible.
+            }
+        });
+    } else {
+        // can we broadcast the tx?
+        if (!bool (Wallet.net ()->broadcast (bytes (tx))))
+            return make_402 (demanded_price (o->Price, Parameter.ExpectedFee, Parameter.MaxExpectedOutputsPerPayment));
 
-        // In order to accept merkle proofs, however, we would need a standard format
-        // for a bitcoin tx with merkle proofs that can be sent over HTTP. I'm not
-        // aware of one.
+        // put the outputs in our wallet.
+        for (const auto &e : our_new_outputs) Wallet.watch_wallet ()->Account.Account[e.Key] = e.Value;
     }
 
-    // can we broadcast the tx?
-    if (!bool (Wallet.net ()->broadcast (processed.Transaction)))
-        return make_402 (demanded_price (offer->Price, Parameter.ExpectedFee, Parameter.MaxExpectedOutputsPerPayment));
-
-    // put the outputs in our wallet.
-    for (const auto &e : our_new_outputs) Wallet.watch_wallet ()->Account.Account[e.Key] = e.Value;
-
     // forward the API call.
-    return (*offer) ();
+    return (*o) ();
 }
 
-struct payment_request : Bitcoin::output {
-    using Bitcoin::output::output;
-    operator std::string () const;
+// make a new 402 response to send back to a user for a given price.
+net::HTTP::response pay_per_call::make_402 (Bitcoin::satoshi price) {
+    payment_address addr = get_new_address ();
+
+    JSON::object_t payment_request {};
+    payment_request ["value"] = Cosmos::write (N (price));
+    payment_request ["address"] = std::string (addr.Address);
+    payment_request ["expiration"] = uint32 (addr.Expiration);
+    payment_request ["memo"] = std::string {} +
+        "please include the given payment of the given amount to the given address " +
+        "the next time you make this call.";
+
+    return net::HTTP::response {
+        net::HTTP::status (402),
+        {{net::HTTP::header::content_type, "application/json"}},
+        JSON (payment_request).dump ()};
+}
+
+ptr<pay_per_call::offer> pay_per_call::offers::operator () (const net::URL &u) const {
+    for (const auto &[key, value] : Offers) if (std::regex_match (static_cast<std::string> (u), key)) return value;
+    return nullptr;
 };
+
+struct whatsonchain_offer : pay_per_call::offer {
+    net::HTTP::response operator () () final override;
+};
+
+pay_per_call::payment_address pay_per_call::get_new_address () {
+    auto &pubkeys = Wallet.watch_wallet ()->Pubkeys;
+    auto *p = pubkeys.Map.contains (pubkeys.Receive);
+    auto next = p->last ().address ();
+    *p = p->next ();
+
+    auto now = Bitcoin::timestamp::now ();
+    Bitcoin::address new_addr {Bitcoin::address::main, next.Key};
+    Addresses[next.Key] = address_data {next.Value.Derivation.first (), time_point (now), time_point (now)};
+    return payment_address {new_addr,
+        Bitcoin::timestamp {uint32 (now) + static_cast<uint32> (Parameter.InactiveAddressExpiration.count () / 1000)}};
+}
+/*
+pay_per_call::offers::offers () {
+
+}
+
+net::HTTP::response whatsonchain_offer::operator () () {
+
+}
+
+parameters::parameters (const io::arg_parser &p) {
+
+}*/
+
